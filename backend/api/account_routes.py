@@ -740,10 +740,10 @@ async def test_llm_connection(payload: dict):
             # Modern models have large context windows, so we can be generous with token limits
             if is_new_model:
                 # Reasoning models (GPT-5/o1) need more tokens for internal reasoning
-                payload_data["max_completion_tokens"] = 2000
+                payload_data["max_completion_tokens"] = 32000
             else:
                 # Regular models (GPT-4, Deepseek, Claude, etc.)
-                payload_data["max_tokens"] = 2000
+                payload_data["max_tokens"] = 32000
 
             # For GPT-5 series, set reasoning_effort to minimal for faster test
             if 'gpt-5' in model_lower:
@@ -761,7 +761,7 @@ async def test_llm_connection(payload: dict):
                         endpoint,
                         headers=headers,
                         json=payload_data,
-                        timeout=10.0,
+                        timeout=900.0,
                         verify=False  # Disable SSL verification for custom AI endpoints
                     )
                 except requests.ConnectionError:
@@ -870,6 +870,9 @@ async def trigger_ai_trade(
     Returns:
         Trade execution result
     """
+
+    print(f" ----------- Nhan API o dau day ne ----------------- ")
+
     try:
         from services.trading_commands import place_ai_driven_crypto_order
 

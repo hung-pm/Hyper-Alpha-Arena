@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -191,6 +191,7 @@ def preview_prompt(
         SUPPORTED_SYMBOLS,
     )
     from services.market_data import get_last_price
+    from services.hyperliquid_market_data import get_recent_bars_with_indicators
     from services.news_feed import fetch_latest_news
     from services.sampling_pool import sampling_pool
     from database.models import Account
@@ -316,25 +317,47 @@ def preview_prompt(
         if not active_symbols:
             active_symbols = base_symbol_order
 
-        prices: Dict[str, float] = {}
+        market_prices: Dict[str, float] = {}
+        price_series: Dict[str, List[Dict[str, Any]]] = {}
         for sym in active_symbols:
+            latest_price: Optional[float] = None
+            recent_bars: List[Dict[str, Any]] = []
+
             try:
-                prices[sym] = get_last_price(sym, "CRYPTO")
+                latest_price, recent_bars = get_recent_bars_with_indicators(
+                    sym,
+                    period="1m",
+                    count=300,
+                    limit=10,
+                )
             except Exception as err:
-                logger.warning(f"Failed to get price for {sym}: {err}")
-                prices[sym] = 0.0
+                logger.warning(f"Failed to load price series for {sym}: {err}")
+
+            if latest_price is None or latest_price <= 0:
+                try:
+                    fallback_price = get_last_price(sym, "CRYPTO")
+                    latest_price = float(fallback_price) if fallback_price else None
+                except Exception as fallback_err:
+                    logger.warning(f"Fallback price fetch failed for {sym}: {fallback_err}")
+                    latest_price = None
+
+            market_prices[sym] = float(latest_price) if latest_price is not None else 0.0
+
+            if recent_bars:
+                price_series[sym] = recent_bars
 
         sampling_data = _build_multi_symbol_sampling_data(active_symbols, sampling_pool)
         context = _build_prompt_context(
             account,
             portfolio,
-            prices,
+            market_prices,
             news_section,
             None,
             None,
             hyperliquid_state,
             symbol_metadata=symbol_metadata_map,
             symbol_order=active_symbols,
+            price_series=price_series or None,
         )
         context["sampling_data"] = sampling_data
 

@@ -82,6 +82,20 @@ services:
       - app_data:/app/data
     restart: unless-stopped
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: hyper-arena-frontend
+    environment:
+      # if the frontend needs runtime env vars, inject here as needed
+      NODE_ENV: production
+    ports:
+      - "3000:80"
+    depends_on:
+      - app
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     driver: local

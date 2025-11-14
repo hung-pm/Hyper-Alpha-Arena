@@ -17,6 +17,9 @@ DEFAULT_PROMPT_TEMPLATE = """You are a cryptocurrency trading AI. Use the data b
 === LATEST CRYPTO NEWS SNIPPET ===
 {news_section}
 
+=== MARKET STATE OVERVIEW ===
+{market_state_all}
+
 Follow these rules:
 - You must analyze every supported symbol provided in the market data and produce a decision entry for each of them.
 - Multi-symbol output is the default: include one JSON object per symbol in the `decisions` array every time you respond.
@@ -57,6 +60,12 @@ Holdings:
 === MARKET DATA ===
 Current prices (USD):
 {market_prices}
+
+Latest technical indicators:
+{indicator_summary}
+
+=== MARKET STATE OVERVIEW ===
+{market_state_all}
 
 === INTRADAY PRICE SERIES ===
 {sampling_data}
@@ -171,8 +180,8 @@ Monitoring {selected_symbols_count} Hyperliquid contracts (multi-coin decisionin
 Current prices (USD):
 {market_prices}
 
-=== INTRADAY PRICE SERIES ===
-{sampling_data}
+=== MARKET STATE OVERVIEW ===
+{market_state_all}
 
 === LATEST CRYPTO NEWS ===
 {news_section}

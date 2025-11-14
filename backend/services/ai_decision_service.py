@@ -64,6 +64,23 @@ def _format_quantity(value: Optional[float], precision: int = 6, default: str = 
         return default
 
 
+def _format_indicator(value: Optional[float], precision: int = 2, default: str = "N/A") -> str:
+    try:
+        if value is None:
+            return default
+        return f"{float(value):.{precision}f}"
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_series(values: List[Optional[float]], precision: int = 3) -> str:
+    numeric_values = [float(v) for v in values if isinstance(v, (int, float, Decimal))]
+    if not numeric_values:
+        return "N/A"
+    formatted = ", ".join(f"{value:.{precision}f}" for value in numeric_values)
+    return f"[{formatted}]"
+
+
 def _build_session_context(account: Account) -> str:
     """Build session context (legacy format for backward compatibility)"""
     now = datetime.utcnow()
@@ -334,6 +351,154 @@ def _build_market_snapshot(
     return "\n".join(lines) if lines else "No market data available."
 
 
+def _build_indicator_summary(
+    price_series: Optional[Dict[str, List[Dict[str, Any]]]],
+    ordered_symbols: List[str],
+) -> str:
+    if not price_series:
+        return "No indicator data available."
+
+    lines: List[str] = []
+    for symbol in ordered_symbols:
+        series = None
+        if price_series:
+            series = price_series.get(symbol) or price_series.get(symbol.upper())
+        if not series:
+            lines.append(f"{symbol}: No indicator data")
+            continue
+
+        latest = series[-1]
+        close = _format_currency(latest.get("close"), precision=4)
+        ema20 = _format_indicator(latest.get("ema_20"), precision=4)
+        ema50 = _format_indicator(latest.get("ema_50"), precision=4)
+        macd = _format_indicator(latest.get("macd"), precision=4)
+        macd_hist = _format_indicator(latest.get("macd_hist"), precision=4)
+        rsi14 = _format_indicator(latest.get("rsi_14"), precision=2)
+        atr14 = _format_indicator(latest.get("atr_14"), precision=4)
+
+        lines.append(
+            f"{symbol}: close=${close} | EMA20={ema20} | EMA50={ema50} | "
+            f"MACD={macd} | MACD_hist={macd_hist} | RSI14={rsi14} | ATR14={atr14}"
+        )
+
+    return "\n".join(lines) if lines else "No indicator data available."
+
+
+def _build_market_state_all(
+    ordered_symbols: List[str],
+    price_series: Optional[Dict[str, List[Dict[str, Any]]]],
+) -> str:
+    if not ordered_symbols:
+        return "No symbols configured for market state."
+
+    lines: List[str] = ["CURRENT MARKET STATE FOR ALL COINS"]
+
+    for symbol in ordered_symbols:
+        series = []
+        if price_series:
+            series = price_series.get(symbol) or price_series.get(symbol.upper()) or []
+
+        lines.append(f"ALL {symbol} DATA")
+
+        if not series:
+            lines.append(f"{symbol}: No intraday indicator data available.")
+            lines.append("")
+            continue
+
+        latest = series[-1]
+        current_price = _format_currency(latest.get("close"), precision=4)
+        current_ema20 = _format_indicator(latest.get("ema_20"), precision=4)
+        current_macd = _format_indicator(latest.get("macd"), precision=3)
+        current_rsi7 = _format_indicator(latest.get("rsi_7"), precision=3)
+
+        lines.append(
+            "current_price = "
+            f"{current_price}, current_ema20 = {current_ema20}, "
+            f"current_macd = {current_macd}, current_rsi_7 = {current_rsi7}"
+        )
+
+        # Optional derivatives like open interest and funding rate
+        latest_oi = latest.get("open_interest") or latest.get("openInterest")
+        if latest_oi is not None:
+            oi_values = [bar.get("open_interest") or bar.get("openInterest") for bar in series]
+            oi_numeric = [float(value) for value in oi_values if isinstance(value, (int, float, Decimal))]
+            avg_oi = sum(oi_numeric) / len(oi_numeric) if oi_numeric else None
+            avg_oi_str = _format_indicator(avg_oi, precision=2) if avg_oi is not None else "N/A"
+            lines.append(
+                "Open Interest: "
+                f"Latest: {_format_indicator(latest_oi, precision=2)} Average: {avg_oi_str}"
+            )
+        else:
+            lines.append("Open Interest: Data unavailable")
+
+        latest_funding = latest.get("funding_rate") or latest.get("fundingRate")
+        if latest_funding is not None:
+            lines.append(f"Funding Rate: {_format_indicator(latest_funding, precision=6)}")
+        else:
+            lines.append("Funding Rate: Data unavailable")
+
+        close_series = _format_series([bar.get("close") for bar in series], precision=4)
+        ema20_series = _format_series([bar.get("ema_20") for bar in series], precision=3)
+        macd_series = _format_series([bar.get("macd") for bar in series], precision=3)
+        rsi7_series = _format_series([bar.get("rsi_7") for bar in series], precision=3)
+        rsi14_series = _format_series([bar.get("rsi_14") for bar in series], precision=3)
+
+        interval_label = latest.get("interval") or latest.get("timeframe") or "1-minute"
+        lines.append(
+            f"Intraday series ({interval_label} intervals, oldest -> latest):"
+        )
+        lines.append(f"Close prices: {close_series}")
+        lines.append(f"EMA20: {ema20_series}")
+        lines.append(f"MACD: {macd_series}")
+        lines.append(f"RSI (7-period): {rsi7_series}")
+        lines.append(f"RSI (14-period): {rsi14_series}")
+
+        # Longer-term context (e.g., 4-hour timeframe)
+        try:
+            from services.hyperliquid_market_data import get_recent_bars_with_indicators
+
+            _, long_term_series = get_recent_bars_with_indicators(
+                symbol,
+                period="4h",
+                count=200,
+                limit=10,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("Failed to load long-term indicators for %s: %s", symbol, exc)
+            long_term_series = []
+
+        if long_term_series:
+            long_latest = long_term_series[-1]
+            long_ema20 = _format_indicator(long_latest.get("ema_20"), precision=3)
+            long_ema50 = _format_indicator(long_latest.get("ema_50"), precision=3)
+            long_atr3 = _format_indicator(long_latest.get("atr_3"), precision=3)
+            long_atr14 = _format_indicator(long_latest.get("atr_14"), precision=3)
+            long_macd_series = _format_series([bar.get("macd") for bar in long_term_series], precision=3)
+            long_rsi14_series = _format_series([bar.get("rsi_14") for bar in long_term_series], precision=3)
+
+            volume_values = [bar.get("volume") for bar in long_term_series]
+            volume_numeric = [float(value) for value in volume_values if isinstance(value, (int, float, Decimal))]
+            latest_volume = _format_indicator(volume_numeric[-1] if volume_numeric else None, precision=3)
+            avg_volume = (
+                _format_indicator(sum(volume_numeric) / len(volume_numeric), precision=3)
+                if volume_numeric
+                else "N/A"
+            )
+
+            lines.append("Longer-term context (4-hour timeframe):")
+            lines.append(f"20-Period EMA: {long_ema20} vs. 50-Period EMA: {long_ema50}")
+            lines.append(f"3-Period ATR: {long_atr3} vs. 14-Period ATR: {long_atr14}")
+            lines.append(f"Current Volume: {latest_volume} vs. Average Volume: {avg_volume}")
+            lines.append(f"MACD series: {long_macd_series}")
+            lines.append(f"RSI (14-period) series: {long_rsi14_series}")
+        else:
+            lines.append("Longer-term context (4-hour timeframe): Data unavailable")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 SYMBOL_PLACEHOLDER = "__SYMBOL_SET__"
 OUTPUT_FORMAT_JSON = (
     '{\n'
@@ -366,7 +531,7 @@ DECISION_TASK_TEXT = (
 def _build_prompt_context(
     account: Account,
     portfolio: Dict[str, Any],
-    prices: Dict[str, float],
+    market_prices: Dict[str, float],
     news_section: str,
     samples: Optional[List] = None,
     target_symbol: Optional[str] = None,
@@ -374,6 +539,7 @@ def _build_prompt_context(
     *,
     symbol_metadata: Optional[Dict[str, Any]] = None,
     symbol_order: Optional[List[str]] = None,
+    price_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     base_portfolio = portfolio or {}
     base_positions = base_portfolio.get("positions") or {}
@@ -452,7 +618,7 @@ def _build_prompt_context(
 
     # Legacy format variables (for backward compatibility with existing templates)
     account_state = _build_account_state(portfolio)
-    market_snapshot = _build_market_snapshot(prices, positions, ordered_symbols)
+    market_snapshot = _build_market_snapshot(market_prices, positions, ordered_symbols)
     session_context = _build_session_context(account)
     sampling_data = _build_sampling_data(samples, target_symbol)
 
@@ -463,7 +629,7 @@ def _build_prompt_context(
     available_cash = _format_currency(portfolio.get('cash'))
     total_account_value = _format_currency(portfolio.get('total_assets'))
     holdings_detail = _build_holdings_detail(positions)
-    market_prices = _build_market_prices(prices, ordered_symbols, symbol_display_map)
+    market_prices_text = _build_market_prices(market_prices, ordered_symbols, symbol_display_map)
     output_format = OUTPUT_FORMAT_JSON.replace(SYMBOL_PLACEHOLDER, output_symbol_choices or "SYMBOL")
 
     # Hyperliquid-specific context
@@ -553,6 +719,19 @@ def _build_prompt_context(
         maintenance_margin = "N/A"
         positions_detail = "No open positions"
 
+    prices_payload = price_series if price_series is not None else market_prices
+    try:
+        prices_json = json.dumps(prices_payload, indent=2, sort_keys=True)
+    except TypeError:
+        prices_json = json.dumps(prices_payload, indent=2)
+
+    if isinstance(price_series, dict):
+        indicator_summary = _build_indicator_summary(price_series, ordered_symbols)
+        market_state_all = _build_market_state_all(ordered_symbols, price_series)
+    else:
+        indicator_summary = "No indicator data available."
+        market_state_all = "No market state data available."
+
     return {
         # Legacy variables (for Default prompt and backward compatibility)
         "account_state": account_state,
@@ -561,7 +740,7 @@ def _build_prompt_context(
         "sampling_data": sampling_data,
         "decision_task": DECISION_TASK_TEXT,
         "output_format": output_format,
-        "prices_json": json.dumps(prices, indent=2, sort_keys=True),
+        "prices_json": prices_json,
         "portfolio_json": json.dumps(portfolio, indent=2, sort_keys=True),
         "portfolio_positions_json": json.dumps(positions, indent=2, sort_keys=True),
         "news_section": news_section,
@@ -574,7 +753,9 @@ def _build_prompt_context(
         "available_cash": available_cash,
         "total_account_value": total_account_value,
         "holdings_detail": positions_detail if hyperliquid_state else holdings_detail,
-        "market_prices": market_prices,
+        "market_prices": market_prices_text,
+    "indicator_summary": indicator_summary,
+        "market_state_all": market_state_all,
         "selected_symbols_csv": selected_symbols_csv,
         "selected_symbols_detail": selected_symbols_detail,
         "selected_symbols_count": len(ordered_symbols),
@@ -642,19 +823,7 @@ def build_chat_completion_endpoints(base_url: str, model: Optional[str] = None) 
         return []
 
     endpoints: List[str] = []
-    base_lower = normalized.lower()
     endpoints.append(f"{normalized}/chat/completions")
-
-    is_deepseek = "deepseek.com" in base_lower
-
-    if is_deepseek:
-        # Deepseek 官方同时支持 https://api.deepseek.com/chat/completions 和 /v1/chat/completions。
-        if base_lower.endswith('/v1'):
-            without_v1 = normalized[:-3]
-            endpoints.append(f"{without_v1}/chat/completions")
-        else:
-            endpoints.append(f"{normalized}/v1/chat/completions")
-
     # Use dict to preserve order while removing duplicates
     deduped = list(dict.fromkeys(endpoints))
     return deduped
@@ -711,12 +880,14 @@ def call_ai_for_decision(
     db: Session,
     account: Account,
     portfolio: Dict,
-    prices: Dict[str, float],
+    market_prices: Dict[str, float],
     samples: Optional[List] = None,
     target_symbol: Optional[str] = None,
     symbols: Optional[List[str]] = None,
     hyperliquid_state: Optional[Dict[str, Any]] = None,
     symbol_metadata: Optional[Dict[str, Any]] = None,
+    *,
+    price_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Call AI model API to get trading decision
 
@@ -724,12 +895,13 @@ def call_ai_for_decision(
         db: Database session
         account: Trading account
         portfolio: Portfolio data
-        prices: Market prices
+        market_prices: Latest market prices used for sizing and summaries
         samples: Legacy single-symbol samples (deprecated, use symbols instead)
         target_symbol: Legacy single symbol (deprecated, use symbols instead)
         symbols: List of symbols to include sampling data for (preferred method)
         hyperliquid_state: Optional Hyperliquid account state for real trading
         symbol_metadata: Optional mapping of symbol -> display name overrides
+        price_series: Optional condensed intraday price history for prompt context
     """
     # Check if this is a default API key
     if _is_default_api_key(account.api_key):
@@ -762,13 +934,14 @@ def call_ai_for_decision(
         context = _build_prompt_context(
             account,
             portfolio,
-            prices,
+            market_prices,
             news_section,
             None,
             None,
             hyperliquid_state,
             symbol_metadata=active_symbol_metadata,
             symbol_order=symbol_order,
+            price_series=price_series,
         )
         context["sampling_data"] = sampling_data
     else:
@@ -776,13 +949,14 @@ def call_ai_for_decision(
         context = _build_prompt_context(
             account,
             portfolio,
-            prices,
+            market_prices,
             news_section,
             samples,
             target_symbol,
             hyperliquid_state,
             symbol_metadata=active_symbol_metadata,
             symbol_order=symbol_order,
+            price_series=price_series,
         )
 
     try:
@@ -830,10 +1004,10 @@ def call_ai_for_decision(
     # Modern models have large context windows, allocate generous token budgets
     if is_new_model:
         # Reasoning models (GPT-5/o1) need more tokens for internal reasoning
-        payload["max_completion_tokens"] = 5000
+        payload["max_completion_tokens"] = 32000
     else:
         # Regular models (GPT-4, Deepseek, Claude, etc.)
-        payload["max_tokens"] = 5000
+        payload["max_tokens"] = 32000
 
     # For GPT-5 family set reasoning_effort to balance latency and quality
     if "gpt-5" in model_lower:
@@ -856,12 +1030,13 @@ def call_ai_for_decision(
         success = False
         for endpoint in endpoints:
             for attempt in range(max_retries):
+                print(f"Calling AI API endpoint: {endpoint} (attempt {attempt + 1}/{max_retries})")
                 try:
                     response = requests.post(
                         endpoint,
                         headers=headers,
                         json=payload,
-                        timeout=30,
+                        timeout=900,
                         verify=False,  # Disable SSL verification for custom AI endpoints
                     )
 
@@ -1088,6 +1263,7 @@ def save_ai_decision(
     executed: bool = False,
     order_id: Optional[int] = None,
     wallet_address: Optional[str] = None,
+    hyperliquid_environment: Optional[str] = None,
 ) -> None:
     """Save AI decision to the decision log"""
     try:
@@ -1135,8 +1311,11 @@ def save_ai_decision(
                 if total_balance > 0:
                     prev_portion = symbol_value / total_balance
 
-        # Get Hyperliquid environment for decision tagging
-        hyperliquid_environment = getattr(account, "hyperliquid_environment", None)
+        # Determine Hyperliquid environment for decision tagging
+        # Prefer an explicit value passed in via kwargs (e.g., caller resolved global trading mode),
+        # otherwise fall back to the account database field.
+        if hyperliquid_environment is None:
+            hyperliquid_environment = getattr(account, "hyperliquid_environment", None)
 
         # Create decision log entry
         decision_log = AIDecisionLog(

@@ -1,11 +1,13 @@
-"""
-Hyperliquid market data service using CCXT
-"""
-import ccxt
+"""Hyperliquid market data service using CCXT."""
+import argparse
+import importlib
+import json
 import logging
-from typing import Dict, List, Any, Optional
+import sys
 from datetime import datetime, timezone
-import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import ccxt
 
 logger = logging.getLogger(__name__)
 
@@ -235,3 +237,144 @@ def get_market_status_from_hyperliquid(symbol: str) -> Dict[str, Any]:
 def get_all_symbols_from_hyperliquid() -> List[str]:
     """Get all available symbols from Hyperliquid"""
     return hyperliquid_client.get_all_symbols()
+
+
+def calculate_indicators(klines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append requested technical indicators to kline data."""
+    if not klines:
+        return []
+
+    try:
+        pd = importlib.import_module("pandas")
+    except ImportError as exc:
+        raise ImportError("pandas is required for indicator calculations") from exc
+
+    df = pd.DataFrame(klines)
+    if df.empty:
+        return []
+
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
+    df["ema_20"] = close.ewm(span=20, adjust=False).mean()
+    df["ema_50"] = close.ewm(span=50, adjust=False).mean()
+
+    fast_ema = close.ewm(span=12, adjust=False).mean()
+    slow_ema = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = fast_ema - slow_ema
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    rsi_periods = [7, 14]
+    for period in rsi_periods:
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        adjusted_loss = avg_loss.replace(0, pd.NA)
+        rs = avg_gain / adjusted_loss
+        df[f"rsi_{period}"] = 100 - (100 / (1 + rs))
+
+    prev_close = close.shift(1)
+    tr_components = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1)
+    true_range = tr_components.max(axis=1)
+    for period in [3, 14]:
+        df[f"atr_{period}"] = true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    df = df.where(pd.notna(df), None)
+
+    enriched = df.to_dict(orient="records")
+    return enriched
+
+
+def get_recent_bars_with_indicators(
+    symbol: str,
+    *,
+    period: str = "1m",
+    count: int = 300,
+    limit: int = 10,
+) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    """Fetch recent Hyperliquid klines with indicators and return the latest price plus condensed history."""
+    klines = get_kline_data_from_hyperliquid(symbol, period, count)
+    if not klines:
+        return None, []
+
+    try:
+        enriched = calculate_indicators(klines)
+    except ImportError as exc:
+        logger.warning("pandas missing for indicator calculation on %s: %s", symbol, exc)
+        enriched = klines
+    except Exception as exc:
+        logger.warning("Indicator calculation failed for %s: %s", symbol, exc)
+        enriched = klines
+
+    if not enriched:
+        return None, []
+
+    try:
+        latest_close = enriched[-1].get("close")
+        latest_price = float(latest_close) if latest_close is not None else None
+    except (IndexError, TypeError, ValueError):
+        latest_price = None
+
+    slice_size = max(1, limit)
+    recent_bars = enriched[-slice_size:]
+    return latest_price, recent_bars
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for indicator requests."""
+    parser = argparse.ArgumentParser(description="Fetch Hyperliquid klines with indicators")
+    parser.add_argument("symbol", nargs="?", default="BTC", help="Base symbol, e.g. BTC")
+    parser.add_argument("-p", "--period", default="1m", help="Timeframe (1m, 5m, 15m, 30m, 1h, 1d)")
+    parser.add_argument("-c", "--count", type=int, default=300, help="Number of klines to request")
+    parser.add_argument("--raw", action="store_true", help="Return raw JSON without summary")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    klines = get_kline_data_from_hyperliquid(args.symbol, args.period, args.count)
+    if not klines:
+        print("No data returned.")
+        sys.exit(1)
+
+    klines = calculate_indicators(klines)
+
+    if args.raw:
+        print(json.dumps(klines, ensure_ascii=False))
+        sys.exit(0)
+
+    print(f"Fetched {len(klines)} klines for {args.symbol.upper()} ({args.period})")
+    first = klines[0].get("datetime_str") or klines[0].get("timestamp")
+    last = klines[-1].get("datetime_str") or klines[-1].get("timestamp")
+    print(f"Range: {first} -> {last}")
+
+    latest = klines[-1]
+    indicator_fields = [
+        "close",
+        "ema_20",
+        "ema_50",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "rsi_7",
+        "rsi_14",
+        "atr_3",
+        "atr_14",
+    ]
+    print("Latest bar indicators:")
+    for key in indicator_fields:
+        value = latest.get(key)
+        print(f"  {key}: {value}")
+
+    print(json.dumps(klines, indent=2, ensure_ascii=False))

@@ -31,6 +31,7 @@ from services.hyperliquid_symbol_service import (
     get_available_symbol_map as get_hyperliquid_symbol_map,
     get_symbol_display as get_hyperliquid_symbol_display,
 )
+from services.hyperliquid_market_data import get_recent_bars_with_indicators
 
 
 logger = logging.getLogger(__name__)
@@ -311,10 +312,32 @@ def place_ai_driven_hyperliquid_order(
         logger.warning("No Hyperliquid watchlist configured, skipping Hyperliquid trading")
         return
 
-    prices = _get_market_prices(selected_symbols)
-    if not prices:
-        logger.warning("Failed to fetch market prices, skipping Hyperliquid trading")
-        return
+    market_prices: Dict[str, float] = {}
+    price_series_map: Dict[str, List[Dict[str, Any]]] = {}
+    for sym in selected_symbols:
+        try:
+            latest_price, recent_bars = get_recent_bars_with_indicators(
+                sym,
+                period="1m",
+                count=300,
+                limit=10,
+            )
+        except Exception as price_err:  # pragma: no cover - defensive
+            logger.warning(f"Failed to load Hyperliquid price series for {sym}: {price_err}")
+            latest_price, recent_bars = None, []
+
+        if latest_price is not None and latest_price > 0:
+            market_prices[sym] = float(latest_price)
+
+        if recent_bars:
+            price_series_map[sym] = recent_bars
+
+    if not market_prices:
+        market_prices = _get_market_prices(selected_symbols)
+        if not market_prices:
+            logger.warning("Failed to fetch Hyperliquid price data, skipping Hyperliquid trading")
+            return
+        logger.warning("Falling back to single-tick Hyperliquid prices without indicators")
 
     # Sampling data availability (informational)
     from services.sampling_pool import sampling_pool
@@ -336,7 +359,7 @@ def place_ai_driven_hyperliquid_order(
         entry.setdefault("name", sym)
         prompt_symbol_metadata[sym] = entry
     symbol_whitelist = set(selected_symbols)
-
+    logger.info(f"Accounts: {', '.join([acc.name for acc in accounts])}")
     # Process each account with separate database connections
     for account in accounts:
         # Each account gets its own database connection
@@ -388,7 +411,8 @@ def place_ai_driven_hyperliquid_order(
                 logger.error(f"Failed to get Hyperliquid client for {account.name}: {client_err}")
                 continue
             wallet_address = getattr(client, "wallet_address", None)
-            decision_kwargs = {"wallet_address": wallet_address}
+            # Include resolved environment so logs consistently record testnet/mainnet/paper
+            decision_kwargs = {"wallet_address": wallet_address, "hyperliquid_environment": environment}
 
             # Get real account state from Hyperliquid
             try:
@@ -459,14 +483,16 @@ def place_ai_driven_hyperliquid_order(
             }
 
             # Call AI for trading decision
+            print(f"------Goi API-----")
             decisions = call_ai_for_decision(
                 db,
                 account,
                 portfolio,
-                prices,
+                market_prices,
                 symbols=selected_symbols,
                 hyperliquid_state=hyperliquid_state,
                 symbol_metadata=prompt_symbol_metadata,
+                price_series=price_series_map or None,
             )
 
             if not decisions:
@@ -525,7 +551,7 @@ def place_ai_driven_hyperliquid_order(
                     save_ai_decision(db, account, decision, portfolio, executed=False, **decision_kwargs)
                     continue
 
-                price = prices.get(symbol)
+                price = market_prices.get(symbol)
                 if not price or price <= 0:
                     logger.warning(f"Invalid price for {symbol} for {account.name}")
                     save_ai_decision(db, account, decision, portfolio, executed=False, **decision_kwargs)
@@ -669,7 +695,7 @@ def place_ai_driven_hyperliquid_order(
                         f"{symbol} size={close_size} (closing {'long' if is_long else 'short'})"
                     )
 
-                    current_price = prices.get(symbol, 0)
+                    current_price = market_prices.get(symbol, price or 0)
 
                     # Price validation for Hyperliquid 1% oracle limit
                     if min_price:
